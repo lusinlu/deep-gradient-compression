@@ -1,0 +1,2 @@
+# deep_gradient_compression
+Partial implementation of paper "DEEP GRADIENT COMPRESSION: REDUCING THE COMMUNICATION BANDWIDTH FOR DISTRIBUTED TRAINING"
