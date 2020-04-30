@@ -10,15 +10,11 @@ for installing required packages run
 
 ## Implementation
 Current implementation consist of only
-* large gradients selection and passing
+* large gradients selection and update
 * small gradients accumulation
 * momentum corelation
+* momentum factor masking
 
-
-## TODO
-* masking
-* gradient clipping
-* learning rate correction
 
 ## References
 [DEEP GRADIENT COMPRESSION:REDUCING THE COMMUNICATION BANDWIDTH FOR DISTRIBUTED TRAINING](https://arxiv.org/pdf/1712.01887.pdf)
