@@ -11,21 +11,26 @@ from math import ceil
 from torch.autograd import Variable
 from torch.multiprocessing import Process
 import argparse
+from deep_gradient_compression import DGC
+torch.manual_seed(0)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_dir', default='./data', help='path where to download, or from where to read data')
-parser.add_argument('--momentum', default=0.8, type=int, help='momentum correlation for accumulated gradients')
+parser.add_argument('--momentum', default=0.6, type=int, help='momentum correlation for accumulated gradients')
 parser.add_argument('--lr', default=1e-2, type=int, help='learning rate')
 parser.add_argument('--epoch', default=10, type=int, help='number of epochs to train')
 parser.add_argument('--batch_size', default=128, type=int, help='batch size which will be divided to number of model instances')
 parser.add_argument('--world_size', default=2, type=int, help='number of model instances to be run parallel')
-parser.add_argument('--threshold', default=0.2, type=float, help='threshold for large gradients, range 0. - 1.')
+parser.add_argument('--persentages', default=[25, 6.25, 1.5625, 0.4, 0.1], type=list, help='exponential decreasing persentages of the gradients for top k selection')
+parser.add_argument('--iters', default=[0, 50, 100, 200, 300], type=list, help='iterations at which persentage will be decreased (for args.persentages)')
 
 args = parser.parse_args()
 
 
-# Simple convolutional network for classification
 class Net_CIFAR(nn.Module):
+    """Dummy Convolutional network for CIFAR10 classification"""
     def __init__(self):
         super(Net_CIFAR, self).__init__()
         self.conv1 = nn.Conv2d(3, 10, kernel_size=5, bias=False)
@@ -44,8 +49,12 @@ class Net_CIFAR(nn.Module):
         return F.log_softmax(x)
 
 
-# Load (or download) dataset and divide data for feeding in different branches
 def partition_dataset():
+    """Load (or download) dataset and divide the data into partitions to feed into different branches
+    :return
+    train_set : function,  partition of the dataset depending on rank of the process
+    b_size : int, batch size at each node
+    """
     dataset = datasets.CIFAR10(root=args.data_dir, train=True,
                      download=True, transform=transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]))
     size = dist.get_world_size()
@@ -61,90 +70,48 @@ def partition_dataset():
     return train_set, b_size
 
 
-# construct tensor with the same shape as weights and put large gradients
-def sparse_to_dense(grad, shape):
-    dense_grad = torch.zeros(shape)
-    dense_grad = dense_grad.put_(grad[1], grad[0])
-    return dense_grad
-
-
-# obtain large gradients from all branches and avarage them
-def avarage_gradient_sparce(sparse_grad):
-    size = float(dist.get_world_size())
-    updated_grads = []
-    for sparse_grad, shape in sparse_grad:
-        layer_grad = sparse_to_dense(sparse_grad, shape)
-        dist.all_reduce(layer_grad, op=dist.reduce_op.SUM, group=0)
-        layer_grad /= size
-        updated_grads.append(layer_grad)
-    return updated_grads
-
-
-# separate and store "total number of gradients x threshold" amount of largest gradients
-def get_large_gradients(param, small_grads, layer_id):
-    current_grad = param.grad.data.view(-1) + small_grads[layer_id][0]
-    _, indices = torch.sort(torch.abs(current_grad), descending=True)
-
-    sparse_indices = indices[:int(len(param.grad.data.view(-1)) * args.threshold)]
-    sparse_values = current_grad.take(sparse_indices)
-    small_grads[layer_id][0][sparse_indices] = 0
-
-    sparse_grad = [[sparse_values, sparse_indices], param.grad.data.shape]
-    return sparse_grad, indices
-
-# accumulate small gradients until they pass threshold
-def accumulate_small_grads(param, sorted_indices, small_grads, layer_id):
-    small_grad_indices = sorted_indices[int(len(param.grad.data.view(-1)) * args.threshold):]
-    small_values = param.grad.data.take(small_grad_indices)
-
-    tmp_tensor = torch.zeros(small_grads[layer_id][0].shape)
-    tmp_tensor.put_(small_grad_indices, small_values)
-
-    # apply momentum term to new gradients
-    tmp_tensor += small_grads[layer_id][0] * args.momentum
-    small_grads[layer_id][0] += tmp_tensor
-
-
-def run():
-    torch.manual_seed(1111)
+def run(rank, world_size):
+    """main training function"""
+    device_id = rank
     train_set, b_size = partition_dataset()
-    model = Net_CIFAR()
+    model = Net_CIFAR().cuda(device_id)
     optimizer = optim.SGD(model.parameters(), lr=args.lr)
     num_batches = ceil(len(train_set.dataset) / float(b_size))
-    small_grads = [[torch.zeros(int(torch.prod(torch.tensor(W.shape)))), name] for name, W in model.named_parameters()]
+
+    dgc_trainer = DGC(model=model, rank=rank, size=world_size, device_id=device_id,
+                      momentum=args.momentum,  full_update_layers=[4],persentages=args.persentages, itreations=args.iters)
+
 
     for epoch in range(args.epoch):
         epoch_loss = 0
-        for data, target in train_set:
-            data, target = Variable(data), Variable(target)
+        for batch_idx, (data, target) in enumerate(train_set):
+            it = epoch * len(train_set) + batch_idx
+
+            data, target = Variable(data.cuda(device_id)), Variable(target.cuda(device_id))
             optimizer.zero_grad()
             output = model(data)
             loss = F.nll_loss(output, target)
             epoch_loss += loss
             loss.backward()
-            sparse_grad_branch = []
-            # choose gradients from each layer for passing and storing
-            for layer_id, (name, param) in enumerate(model.named_parameters()):
-                if param.requires_grad:
-                    large_grads, sorted_indices = get_large_gradients(param, small_grads, layer_id)
-                    sparse_grad_branch.append(large_grads)
-                    accumulate_small_grads(param, sorted_indices, small_grads, layer_id)
+            dgc_trainer.gradient_update(it)
 
-            # update gradients
-            updated_grads = avarage_gradient_sparce(sparse_grad=sparse_grad_branch)
-            for i, (name, param) in enumerate(model.named_parameters()):
-                if param.requires_grad:
-                    param.grad.data = updated_grads[i]
             optimizer.step()
 
         print('Rank ',dist.get_rank(), ', epoch ', epoch, ': ',epoch_loss / num_batches)
 
 
-def init_processing(rank, size, fn, backend='tcp'):
+def init_processing(rank, size, fn, backend='gloo'):
+    """initiale each process by indicate where the master node is located(by ip and port) and run main function
+    :parameter
+    rank : int , rank of current process
+    size : int, overall number of processes
+    fn : function, function to run at each node
+    backend : string, name of the backend for distributed operations
+    """
     os.environ['MASTER_ADDR'] = '127.0.0.1'
     os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend=backend, rank=rank, world_size=size)
-    fn()
+    fn(rank, size)
 
 
 if __name__ == '__main__':
